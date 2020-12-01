@@ -48,6 +48,9 @@ type RTSPClient struct {
 	OptionIntervalMillis int64
 	SDPRaw               string
 
+	debugLogEnable bool
+	lastRtpSN      uint16
+
 	Agent    string
 	authLine string
 
@@ -71,6 +74,7 @@ func NewRTSPClient(server *Server, rawUrl string, sendOptionMillis int64, agent 
 	if err != nil {
 		return
 	}
+	debugLogEnable := utils.Conf().Section("rtsp").Key("debug_log_enable").MustInt(0)
 	client = &RTSPClient{
 		Server:               server,
 		Stoped:               false,
@@ -85,6 +89,7 @@ func NewRTSPClient(server *Server, rawUrl string, sendOptionMillis int64, agent 
 		OptionIntervalMillis: sendOptionMillis,
 		StartAt:              time.Now(),
 		Agent:                agent,
+		debugLogEnable:       debugLogEnable != 0,
 	}
 	client.logger = log.New(os.Stdout, fmt.Sprintf("[%s]", client.ID), log.LstdFlags|log.Lshortfile)
 	if !utils.Debug {
@@ -413,15 +418,24 @@ func (client *RTSPClient) startStream() {
 				client.logger.Printf("unknow rtp pack type, channel:%v", channel)
 				continue
 			}
-			if pack == nil {
-				client.logger.Printf("session tcp got nil rtp pack")
-				continue
+
+			if client.debugLogEnable {
+				rtp := ParseRTP(pack.Buffer.Bytes())
+				if rtp != nil {
+					rtpSN := uint16(rtp.SequenceNumber)
+					if client.lastRtpSN != 0 && client.lastRtpSN+1 != rtpSN {
+						client.logger.Printf("%s, %d packets lost, current SN=%d, last SN=%d\n", client.String(), rtpSN-client.lastRtpSN, rtpSN, client.lastRtpSN)
+					}
+					client.lastRtpSN = rtpSN
+				}
+
+				elapsed := time.Now().Sub(loggerTime)
+				if elapsed >= 30*time.Second {
+					client.logger.Printf("%v read rtp frame.", client)
+					loggerTime = time.Now()
+				}
 			}
-			elapsed := time.Now().Sub(loggerTime)
-			if elapsed >= 10*time.Second {
-				client.logger.Printf("%v read rtp frame.", client)
-				loggerTime = time.Now()
-			}
+
 			client.InBytes += int(length + 4)
 			for _, h := range client.RTPHandles {
 				h(pack)
@@ -500,6 +514,10 @@ func (client *RTSPClient) Stop() {
 		client.connRW.Flush()
 		client.Conn.Close()
 		client.Conn = nil
+	}
+	if client.UDPServer != nil {
+		client.UDPServer.Stop()
+		client.UDPServer = nil
 	}
 }
 
@@ -617,7 +635,7 @@ func (client *RTSPClient) RequestWithPath(method string, path string, headers ma
 		//		return
 		//	}
 		//}
-		if strings.Index(s, "Content-Length:") == 0 {
+		if strings.Index(strings.ToLower(s), "content-length:") == 0 {
 			splits := strings.Split(s, ":")
 			contentLen, err = strconv.Atoi(strings.TrimSpace(splits[1]))
 			if err != nil {
@@ -642,8 +660,10 @@ func (client *RTSPClient) Request(method string, headers map[string]string) (*Re
 }
 
 func (client *RTSPClient) RequestNoResp(method string, headers map[string]string) (err error) {
-	l, err := url.Parse(client.URL)
-	if err != nil {
+	var (
+		l *url.URL
+	)
+	if l, err = url.Parse(client.URL); err != nil {
 		return fmt.Errorf("Url parse error:%v", err)
 	}
 	l.User = nil

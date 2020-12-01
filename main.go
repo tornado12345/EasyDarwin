@@ -136,6 +136,9 @@ func (p *program) Start(s service.Service) (err error) {
 			}
 			for i := len(streams) - 1; i > -1; i-- {
 				v := streams[i]
+				if rtsp.GetServer().GetPusher(v.CustomPath) != nil {
+					continue
+				}
 				agent := fmt.Sprintf("EasyDarwinGo/%s", routers.BuildVersion)
 				if routers.BuildDateTime != "" {
 					agent = fmt.Sprintf("%s(%s)", agent, routers.BuildDateTime)
@@ -146,16 +149,13 @@ func (p *program) Start(s service.Service) (err error) {
 				}
 				client.CustomPath = v.CustomPath
 
-				pusher := rtsp.NewClientPusher(client)
-				if rtsp.GetServer().GetPusher(pusher.Path()) != nil {
-					continue
-				}
 				err = client.Start(time.Duration(v.IdleTimeout) * time.Second)
 				if err != nil {
 					log.Printf("Pull stream err :%v", err)
 					continue
 				}
-				rtsp.GetServer().AddPusher(pusher, false)
+				pusher := rtsp.NewClientPusher(client)
+				rtsp.GetServer().AddPusher(pusher)
 				//streams = streams[0:i]
 				//streams = append(streams[:i], streams[i+1:]...)
 			}
@@ -210,9 +210,7 @@ func main() {
 	if len(tail) > 0 {
 		cmd := strings.ToLower(tail[0])
 		if cmd == "install" || cmd == "stop" || cmd == "start" || cmd == "uninstall" {
-			if cmd == "install" || cmd == "stop" {
-				figure.NewFigure("EasyDarwin", "", false).Print()
-			}
+			figure.NewFigure("EasyDarwin", "", false).Print()
 			log.Println(svcConfig.Name, cmd, "...")
 			if err = service.Control(s, cmd); err != nil {
 				log.Println(err)

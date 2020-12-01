@@ -105,6 +105,7 @@ type Session struct {
 	authorizationEnable bool
 	nonce               string
 	closeOld            bool
+	debugLogEnable      bool
 
 	AControl string
 	VControl string
@@ -133,7 +134,7 @@ type Session struct {
 }
 
 func (session *Session) String() string {
-	return fmt.Sprintf("session[%v][%v][%s][%s]", session.Type, session.TransType, session.Path, session.ID)
+	return fmt.Sprintf("session[%v][%v][%s][%s][%s]", session.Type, session.TransType, session.Path, session.ID, session.Conn.RemoteAddr().String())
 }
 
 func NewSession(server *Server, conn net.Conn) *Session {
@@ -142,6 +143,7 @@ func NewSession(server *Server, conn net.Conn) *Session {
 	timeoutTCPConn := &RichConn{conn, time.Duration(timeoutMillis) * time.Millisecond}
 	authorizationEnable := utils.Conf().Section("rtsp").Key("authorization_enable").MustInt(0)
 	close_old := utils.Conf().Section("rtsp").Key("close_old").MustInt(0)
+	debugLogEnable := utils.Conf().Section("rtsp").Key("debug_log_enable").MustInt(0)
 	session := &Session{
 		ID:                  shortid.MustGenerate(),
 		Server:              server,
@@ -150,6 +152,7 @@ func NewSession(server *Server, conn net.Conn) *Session {
 		StartAt:             time.Now(),
 		Timeout:             utils.Conf().Section("rtsp").Key("timeout").MustInt(0),
 		authorizationEnable: authorizationEnable != 0,
+		debugLogEnable:      debugLogEnable != 0,
 		RTPHandles:          make([]func(*RTPPack), 0),
 		StopHandles:         make([]func(), 0),
 		vRTPChannel:         -1,
@@ -246,11 +249,7 @@ func (session *Session) Start() {
 					Buffer: rtpBuf,
 				}
 			default:
-				logger.Printf("unknow rtp pack type, %v", pack.Type)
-				continue
-			}
-			if pack == nil {
-				logger.Printf("session tcp got nil rtp pack")
+				logger.Printf("unknow rtp pack type, %v", channel)
 				continue
 			}
 			session.InBytes += rtpLen + 4
@@ -368,6 +367,7 @@ func (session *Session) handleRequest(req *Request) {
 	res := NewResponse(200, "OK", req.Header["CSeq"], session.ID, "")
 	defer func() {
 		if p := recover(); p != nil {
+			logger.Printf("handleRequest err ocurs:%v", p)
 			res.StatusCode = 500
 			res.Status = fmt.Sprintf("Inner Server Error, %v", p)
 		}
@@ -382,7 +382,11 @@ func (session *Session) handleRequest(req *Request) {
 		case "PLAY", "RECORD":
 			switch session.Type {
 			case SESSEION_TYPE_PLAYER:
-				session.Pusher.AddPlayer(session.Player)
+				if session.Pusher.HasPlayer(session.Player) {
+					session.Player.Pause(false)
+				} else {
+					session.Pusher.AddPlayer(session.Player)
+				}
 				// case SESSION_TYPE_PUSHER:
 				// 	session.Server.AddPusher(session.Pusher)
 			}
@@ -448,13 +452,46 @@ func (session *Session) handleRequest(req *Request) {
 			session.VCodec = sdp.Codec
 			logger.Printf("video codec[%s]\n", session.VCodec)
 		}
-		session.Pusher = NewPusher(session)
+		addPusher := false
+		if session.closeOld {
+			r, _ := session.Server.TryAttachToPusher(session)
+			if r < -1 {
+				logger.Printf("reject pusher.")
+				res.StatusCode = 406
+				res.Status = "Not Acceptable"
+			} else if r == 0 {
+				addPusher = true
+			} else {
+				logger.Printf("Attached to old pusher")
+				// 尝试发给客户端ANNOUCE
+				// players := pusher.GetPlayers()
+				// for _, v := range players {
+				// 	sess := v.Session
 
-		addedToServer := session.Server.AddPusher(session.Pusher, session.closeOld)
-		if !addedToServer {
-			logger.Printf("reject pusher.")
-			res.StatusCode = 406
-			res.Status = "Not Acceptable"
+				// 	hearers := make(map[string]string)
+				// 	hearers["Content-Type"] = "application/sdp"
+				// 	hearers["Session"] = sess.ID
+				// 	hearers["Content-Length"] = strconv.Itoa(len(v.SDPRaw))
+				// 	var req = Request{Method: ANNOUNCE, URL: v.URL, Version: "1.0", Header: hearers, Body: pusher.SDPRaw()}
+				// 	sess.connWLock.Lock()
+				// 	logger.Println(req.String())
+				// 	outBytes := []byte(req.String())
+				// 	sess.connRW.Write(outBytes)
+				// 	sess.connRW.Flush()
+				// 	sess.connWLock.Unlock()
+				// }
+			}
+		} else {
+			addPusher = true
+		}
+		if addPusher {
+			session.Pusher = NewPusher(session)
+			addedToServer := session.Server.AddPusher(session.Pusher)
+			if !addedToServer {
+				logger.Printf("reject pusher.")
+				res.StatusCode = 406
+				res.Status = "Not Acceptable"
+			}
 		}
 	case "DESCRIBE":
 		session.Type = SESSEION_TYPE_PLAYER
@@ -649,6 +686,13 @@ func (session *Session) handleRequest(req *Request) {
 			res.Status = "Error Status"
 			return
 		}
+	case "PAUSE":
+		if session.Player == nil {
+			res.StatusCode = 500
+			res.Status = "Error Status"
+			return
+		}
+		session.Player.Pause(true)
 	}
 }
 
